@@ -5,12 +5,30 @@ local Object = require "libs.classic"
 local Board = require "src.Board"
 local BoardRenderer = require "src.BoardRenderer"
 local InputHandler = require "src.InputHandler"
+local EasyAI = require "src.ai.EasyAI"
+local MediumAI = require "src.ai.MediumAI"
+local HardAI = require "src.ai.HardAI"
+
+-- SOLID 준수를 위한 신규 모듈 의존성 주입
+local MoveValidator = require "src.MoveValidator"
+local GameStateDetector = require "src.GameStateDetector"
+local TimeManager = require "src.TimeManager"
+local SoundManager = require "src.SoundManager"
 
 local Game = Object:extend()
 
 function Game:new()
     self.boardRenderer = BoardRenderer()
     self.inputHandler = InputHandler(self.boardRenderer)
+    self.aiStrategies = {
+        easy = EasyAI(),
+        medium = MediumAI(),
+        hard = HardAI()
+    }
+    
+    -- 시간 및 사운드 관리를 전담 모듈로 이관 (SRP 준수)
+    self.timeManager = TimeManager(600)
+    self.soundManager = SoundManager()
     
     -- 화면 상태 및 모드 관리 변수
     self.screenState = "menu"        -- 'menu', 'difficulty_select', 'playing'
@@ -20,15 +38,13 @@ function Game:new()
     -- 게임 플레이 상태 초기화
     self:resetGame()
     
-    -- check.wav와 checkmate.wav 자동 생성
-    self:generateWavs()
-    
     -- 오디오 소스 추가 (착수음, 처치음, 체크음, 체크메이트음)
-    if love and love.audio and love.audio.newSource then
-        self.moveSound = love.audio.newSource("move.wav", "static")
-        self.captureSound = love.audio.newSource("capture.wav", "static")
-        self.checkSound = love.audio.newSource("check.wav", "static")
-        self.checkmateSound = love.audio.newSource("checkmate.wav", "static")
+    -- SoundManager 내부에서 관리하지만 하위 호환성을 위해 레퍼런스 유지
+    if self.soundManager then
+        self.moveSound = self.soundManager.moveSound
+        self.captureSound = self.soundManager.captureSound
+        self.checkSound = self.soundManager.checkSound
+        self.checkmateSound = self.soundManager.checkmateSound
     end
 end
 
@@ -48,8 +64,15 @@ function Game:resetGame()
     self.board.enPassantTarget = nil
     self.pendingPromotion = nil
     
-    self.whiteTime = 600
-    self.blackTime = 600
+    -- TimeManager 초기화 및 동기화
+    if self.timeManager then
+        self.timeManager:reset()
+        self.whiteTime = self.timeManager.whiteTime
+        self.blackTime = self.timeManager.blackTime
+    else
+        self.whiteTime = 600
+        self.blackTime = 600
+    end
     self.capturedPieces = { white = {}, black = {} }
     
     self.gameOverReason = nil
@@ -58,6 +81,10 @@ function Game:resetGame()
     -- AI 관련 대기 타이머 및 연출용 상태 초기화
     self.aiTimer = 0.8
     self.aiSelectedMove = nil
+
+    -- FEN 규칙용 클록 변수 초기화
+    self.halfmoveClock = 0
+    self.fullmoveNumber = 1
 end
 
 -- 가상의 칸 또는 마우스 클릭 격자 좌표 선택 시 비즈니스 규칙 처리
@@ -144,11 +171,27 @@ function Game:selectSquare(row, col)
             return true
         end
         
-        -- 턴 교대 (white <-> black) 및 피셔 딜레이 가산 (+5초)
-        if self.currentTurn == "white" then
-            self.whiteTime = self.whiteTime + 5
+        -- FEN 규칙 클록 트래킹
+        if movingPiece.type == "pawn" or isCapture then
+            self.halfmoveClock = 0
         else
-            self.blackTime = self.blackTime + 5
+            self.halfmoveClock = self.halfmoveClock + 1
+        end
+        if self.currentTurn == "black" then
+            self.fullmoveNumber = self.fullmoveNumber + 1
+        end
+
+        -- 턴 교대 (white <-> black) 및 피셔 딜레이 가산 (+5초) (TimeManager 활용)
+        if self.timeManager then
+            self.timeManager:addIncrement(self.currentTurn, 5)
+            self.whiteTime = self.timeManager.whiteTime
+            self.blackTime = self.timeManager.blackTime
+        else
+            if self.currentTurn == "white" then
+                self.whiteTime = self.whiteTime + 5
+            else
+                self.blackTime = self.blackTime + 5
+            end
         end
         self.currentTurn = (self.currentTurn == "white") and "black" or "white"
         
@@ -192,77 +235,28 @@ function Game:isValidMove(row, col)
     return false
 end
 
--- 특정 기물의 유효 이동 중, 자신의 킹을 위험(체크)에 노출시키지 않는 '합법적 수'만 필터링합니다.
+-- 특정 기물의 유효 이동 중, 자신의 킹을 위험(체크)에 노출시키지 않는 '합법적 수'만 필터링합니다. (MoveValidator 이관)
 function Game:getLegalMoves(piece, pos)
-    local pseudoMoves = piece:getValidMoves(self.board, pos)
-    local legalMoves = {}
-    
-    for _, move in ipairs(pseudoMoves) do
-        -- 가상 이동 수행
-        local originalPiece = self.board:getPiece(move.row, move.col)
-        self.board:setPiece(pos.row, pos.col, nil)
-        self.board:setPiece(move.row, move.col, piece)
-        
-        -- 자신의 킹이 체크당하는지 검사
-        local inCheck = self.board:isInCheck(piece.color)
-        
-        -- 가상 이동 되돌리기
-        self.board:setPiece(move.row, move.col, originalPiece)
-        self.board:setPiece(pos.row, pos.col, piece)
-        
-        if not inCheck then
-            table.insert(legalMoves, move)
-        end
-    end
-    
-    return legalMoves
+    return MoveValidator.getLegalMoves(self.board, piece, pos)
 end
 
--- 특정 플레이어가 둘 수 있는 합법적인 수(Legal Moves)가 하나라도 있는지 확인합니다.
+-- 특정 플레이어가 둘 수 있는 합법적인 수(Legal Moves)가 하나라도 있는지 확인합니다. (MoveValidator 이관)
 function Game:hasLegalMoves(color)
-    for r = 1, 8 do
-        for c = 1, 8 do
-            local piece = self.board:getPiece(r, c)
-            if piece and piece.color == color then
-                local legalMoves = self:getLegalMoves(piece, {row = r, col = c})
-                if #legalMoves > 0 then
-                    return true
-                end
-            end
-        end
-    end
-    return false
+    return MoveValidator.hasLegalMoves(self.board, color)
 end
 
--- 특정 플레이어가 체크메이트 상태인지 검사합니다.
+-- 특정 플레이어가 체크메이트 상태인지 검사합니다. (MoveValidator 이관)
 function Game:isCheckmate(color)
-    -- 체크 상태가 아니라면 체크메이트가 아님
-    if not self.board:isInCheck(color) then
-        return false
-    end
-    return not self:hasLegalMoves(color)
+    return MoveValidator.isCheckmate(self.board, color)
 end
 
--- 게임 종료 조건(체크메이트, 스테일메이트, 기물 부족 무승부)을 최종 검사 및 반영합니다.
+-- 게임 종료 조건(체크메이트, 스테일메이트, 기물 부족 무승부)을 최종 검사 및 반영합니다. (GameStateDetector 이관)
 function Game:checkGameEndStatus()
-    -- 1. 기물 부족 무승부 검증
-    if self.board:hasInsufficientMaterial() then
+    local isOver, winner, reason = GameStateDetector.detectGameEnd(self.board, self.currentTurn)
+    if isOver then
         self.isGameOver = true
-        self.winner = "draw"
-        self.gameOverReason = "insufficient_material"
-        return
-    end
-    
-    -- 2. 합법수 유무에 따른 체크메이트 / 스테일메이트 검증
-    if not self:hasLegalMoves(self.currentTurn) then
-        self.isGameOver = true
-        if self.board:isInCheck(self.currentTurn) then
-            self.winner = (self.currentTurn == "white") and "black" or "white"
-            self.gameOverReason = "checkmate"
-        else
-            self.winner = "draw"
-            self.gameOverReason = "stalemate"
-        end
+        self.winner = winner
+        self.gameOverReason = reason
     end
 end
 
@@ -298,10 +292,23 @@ function Game:promotePawn(pieceType)
     -- 프로모션 완료 후 피셔 딜레이 가산 (+5초), 턴 교대 및 게임 종료 상태 확인
     local isCapture = self.pendingPromotion.isCapture
     self.pendingPromotion = nil
-    if self.currentTurn == "white" then
-        self.whiteTime = self.whiteTime + 5
+    
+    -- 프로모션은 폰 이동이므로 하프무브 리셋
+    self.halfmoveClock = 0
+    if self.currentTurn == "black" then
+        self.fullmoveNumber = self.fullmoveNumber + 1
+    end
+
+    if self.timeManager then
+        self.timeManager:addIncrement(self.currentTurn, 5)
+        self.whiteTime = self.timeManager.whiteTime
+        self.blackTime = self.timeManager.blackTime
     else
-        self.blackTime = self.blackTime + 5
+        if self.currentTurn == "white" then
+            self.whiteTime = self.whiteTime + 5
+        else
+            self.blackTime = self.blackTime + 5
+        end
     end
     self.currentTurn = (self.currentTurn == "white") and "black" or "white"
     
@@ -441,25 +448,18 @@ function Game:update(dt)
         self:updateAI(dt)
     end
 
-    -- 게임이 종료되었거나 프로모션 선택 대기 중, 혹은 무승부 제안 대기 중이면 타이머 흐르지 않음
-    if self.isGameOver or self.pendingPromotion or self.pendingDrawOffer then return end
-
-    if self.currentTurn == "white" then
-        self.whiteTime = self.whiteTime - dt
-        if self.whiteTime <= 0 then
-            self.whiteTime = 0
-            self.isGameOver = true
-            self.winner = "black"
-            self.gameOverReason = "timeout"
-        end
-    else
-        self.blackTime = self.blackTime - dt
-        if self.blackTime <= 0 then
-            self.blackTime = 0
-            self.isGameOver = true
-            self.winner = "white"
-            self.gameOverReason = "timeout"
-        end
+    -- TimeManager를 통한 타이머 업데이트 진행 (SRP 준수)
+    local isPaused = self.isGameOver or self.pendingPromotion or self.pendingDrawOffer
+    local isTimeout, winner, reason = self.timeManager:update(dt, self.gameMode, self.currentTurn, isPaused)
+    
+    -- 대국 시간 값 로컬 변수 동기화
+    self.whiteTime = self.timeManager.whiteTime
+    self.blackTime = self.timeManager.blackTime
+    
+    if isTimeout then
+        self.isGameOver = true
+        self.winner = winner
+        self.gameOverReason = reason
     end
 end
 
@@ -472,26 +472,12 @@ function Game:updateAI(dt)
 
     if self.aiTimer <= 0 then
         if not self.aiSelectedMove then
-            -- 1단계: 기물 선택
-            local allMoves = {}
-            for r = 1, 8 do
-                for c = 1, 8 do
-                    local piece = self.board:getPiece(r, c)
-                    if piece and piece.color == "black" then
-                        local legalMoves = self:getLegalMoves(piece, {row = r, col = c})
-                        for _, mv in ipairs(legalMoves) do
-                            table.insert(allMoves, {
-                                from = {row = r, col = c},
-                                to = {row = mv.row, col = mv.col}
-                            })
-                        end
-                    end
-                end
-            end
+            -- 1단계: 기물 선택 및 강조
+            local strategy = self.aiStrategies[self.aiDifficulty or "easy"]
+            local move = strategy:getBestMove(self.board, "black", self)
 
-            if #allMoves > 0 then
-                local idx = math.random(1, #allMoves)
-                self.aiSelectedMove = allMoves[idx]
+            if move then
+                self.aiSelectedMove = move
                 
                 -- 기물 선택 강조
                 self:selectSquare(self.aiSelectedMove.from.row, self.aiSelectedMove.from.col)
@@ -543,117 +529,10 @@ function Game:draw()
     )
 end
 
--- check.wav와 checkmate.wav 오디오 파일을 프로그램적으로 생성합니다.
-function Game:generateWavs()
-    local function file_exists(name)
-        local f = io.open(name, "r")
-        if f then f:close() return true end
-        return false
-    end
-    
-    local function to_int32_le(val)
-        local b1 = val % 256
-        local b2 = math.floor(val / 256) % 256
-        local b3 = math.floor(val / 65536) % 256
-        local b4 = math.floor(val / 16777216) % 256
-        return string.char(b1, b2, b3, b4)
-    end
-    
-    local function to_int16_le(val)
-        local b1 = val % 256
-        local b2 = math.floor(val / 256) % 256
-        return string.char(b1, b2)
-    end
-
-    local function write_wav(filename, duration, sample_rate, wave_func)
-        local num_samples = math.floor(duration * sample_rate)
-        local data_size = num_samples
-        local file_size = 36 + data_size
-        
-        local header = "RIFF" .. to_int32_le(file_size) .. "WAVE" .. "fmt " ..
-                       to_int32_le(16) .. to_int16_le(1) .. to_int16_le(1) ..
-                       to_int32_le(sample_rate) .. to_int32_le(sample_rate) ..
-                       to_int16_le(1) .. to_int16_le(8) .. "data" .. to_int32_le(data_size)
-        
-        local data = {}
-        for i = 1, num_samples do
-            local t = (i - 1) / sample_rate
-            local val = wave_func(t, duration)
-            local byte_val = math.floor((val + 1) * 127.5 + 0.5)
-            if byte_val < 0 then byte_val = 0 end
-            if byte_val > 255 then byte_val = 255 end
-            data[i] = string.char(byte_val)
-        end
-        
-        local f = io.open(filename, "wb")
-        if f then
-            f:write(header)
-            f:write(table.concat(data))
-            f:close()
-        end
-    end
-    
-    if not file_exists("src/check.wav") then
-        -- Check sound: A sharp high-pitched double warning beep (0.18s)
-        write_wav("src/check.wav", 0.18, 11025, function(t, duration)
-            local volume = 0.5
-            local env = math.max(0, 1 - t/duration)
-            if t > 0.07 and t < 0.11 then
-                return 0
-            end
-            local freq = 1200
-            return volume * env * math.sin(2 * math.pi * freq * t)
-        end)
-    end
-    
-    if not file_exists("src/checkmate.wav") then
-        -- Checkmate sound: A descending, dramatic game over chime (0.6s)
-        write_wav("src/checkmate.wav", 0.6, 11025, function(t, duration)
-            local volume = 0.4
-            local env = math.exp(-3 * t)
-            local freq = 600 - (400 * (t / duration))
-            local base = math.sin(2 * math.pi * freq * t)
-            local sub = math.sin(2 * math.pi * (freq * 0.75) * t)
-            local third = math.sin(2 * math.pi * (freq * 1.25) * t)
-            return volume * env * (base + 0.4 * sub + 0.3 * third)
-        end)
-    end
-end
-
--- 조작 종류 및 보드 상태에 따라 사운드를 중지하고 올바른 효과음을 즉각 재생합니다.
+-- 조작 종류 및 보드 상태에 따라 사운드를 중지하고 올바른 효과음을 즉각 재생합니다. (SoundManager 이관)
 function Game:playMoveSound(isCapture)
-    if _TESTING then
-        return
-    end
-    if not (self.moveSound and self.captureSound and self.checkSound and self.checkmateSound) then
-        return
-    end
-    
-    self.moveSound:stop()
-    self.captureSound:stop()
-    self.checkSound:stop()
-    self.checkmateSound:stop()
-    
-    if self.isGameOver then
-        if self.gameOverReason == "checkmate" then
-            self.checkmateSound:play()
-        else
-            if isCapture then
-                self.captureSound:play()
-            else
-                self.moveSound:play()
-            end
-        end
-    else
-        -- 턴이 전환된 상태이므로, 현재 차례인 플레이어가 체크당하고 있는지 확인
-        if self.board:isInCheck(self.currentTurn) then
-            self.checkSound:play()
-        elseif isCapture then
-            self.captureSound:play()
-        else
-            self.moveSound:play()
-        end
-    end
+    local isInCheck = self.board:isInCheck(self.currentTurn)
+    self.soundManager:playMoveSound(self.isGameOver, self.gameOverReason, isCapture, isInCheck)
 end
 
 return Game

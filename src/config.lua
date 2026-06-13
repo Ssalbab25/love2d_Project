@@ -1,1 +1,4 @@
--- 해상도 등 게임 설정 관리 클래스
+local config = {
+    isTesting = false
+}
+return config
