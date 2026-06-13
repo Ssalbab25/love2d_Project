@@ -56,6 +56,18 @@ function Pawn:getValidMoves(board, currentPos)
         end
     end
     
+    -- 4. 앙파상 대각선 공격 검사
+    if board.enPassantTarget then
+        local ep = board.enPassantTarget
+        if ep.row == diagRow then
+            for _, diagCol in ipairs(diagCols) do
+                if diagCol == ep.col then
+                    table.insert(moves, {row = ep.row, col = ep.col, isEnPassant = true})
+                end
+            end
+        end
+    end
+    
     return moves
 end
 
